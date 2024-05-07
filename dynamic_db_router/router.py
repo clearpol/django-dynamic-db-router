@@ -1,29 +1,35 @@
 import threading
 from functools import wraps
 from uuid import uuid4
+from contextvars import ContextVar
 
 from django.db import connections
 
 THREAD_LOCAL = threading.local()
 
+DB_FOR_READ_OVERRIDE = ContextVar('DB_FOR_READ_OVERRIDE', default='default')
+DB_FOR_WRITE_OVERRIDE = ContextVar('DB_FOR_WRITE_OVERRIDE', default='default')
+ 
 
 class DynamicDbRouter(object):
     """A router that decides what db to read from based on a variable
     local to the current thread.
     """
-
+ 
     def db_for_read(self, model, **hints):
-        return getattr(THREAD_LOCAL, 'DB_FOR_READ_OVERRIDE', ['default'])[-1]
-
+        return DB_FOR_READ_OVERRIDE.get()
+        # return getattr(THREAD_LOCAL, 'DB_FOR_READ_OVERRIDE', ['default'])[-1]
+ 
     def db_for_write(self, model, **hints):
-        return getattr(THREAD_LOCAL, 'DB_FOR_WRITE_OVERRIDE', ['default'])[-1]
-
+        return DB_FOR_WRITE_OVERRIDE.get()
+        # return getattr(THREAD_LOCAL, 'DB_FOR_WRITE_OVERRIDE', ['default'])[-1]
+ 
     def allow_relation(self, *args, **kwargs):
         return True
-
+ 
     def allow_syncdb(self, *args, **kwargs):
         return None
-
+ 
     def allow_migrate(self, *args, **kwargs):
         return None
 
@@ -83,45 +89,33 @@ class in_database(object):
     def __init__(self, database, read=True, write=False):
         self.read = read
         self.write = write
+        self.database = database
         self.created_db_config = False
-        if isinstance(database, str):
-            self.database = database
-        elif isinstance(database, dict):
-            # Note: this invalidates the docs above. Update them
-            # eventually.
+        if isinstance(database, dict):
             self.created_db_config = True
             self.unique_db_id = str(uuid4())
             connections.databases[self.unique_db_id] = database
             self.database = self.unique_db_id
-        else:
-            msg = ("database must be an identifier for an existing db, "
-                   "or a complete configuration.")
-            raise ValueError(msg)
-
+ 
     def __enter__(self):
-        if not hasattr(THREAD_LOCAL, 'DB_FOR_READ_OVERRIDE'):
-            THREAD_LOCAL.DB_FOR_READ_OVERRIDE = ['default']
-        if not hasattr(THREAD_LOCAL, 'DB_FOR_WRITE_OVERRIDE'):
-            THREAD_LOCAL.DB_FOR_WRITE_OVERRIDE = ['default']
-        read_db = (self.database if self.read
-                   else THREAD_LOCAL.DB_FOR_READ_OVERRIDE[-1])
-        write_db = (self.database if self.write
-                    else THREAD_LOCAL.DB_FOR_WRITE_OVERRIDE[-1])
-        THREAD_LOCAL.DB_FOR_READ_OVERRIDE.append(read_db)
-        THREAD_LOCAL.DB_FOR_WRITE_OVERRIDE.append(write_db)
+        self.original_read_db = DB_FOR_READ_OVERRIDE.get()
+        self.original_write_db = DB_FOR_WRITE_OVERRIDE.get()
+        if self.read:
+            DB_FOR_READ_OVERRIDE.set(self.database)
+        if self.write:
+            DB_FOR_WRITE_OVERRIDE.set(self.database)
         return self
-
+ 
     def __exit__(self, exc_type, exc_value, traceback):
-        THREAD_LOCAL.DB_FOR_READ_OVERRIDE.pop()
-        THREAD_LOCAL.DB_FOR_WRITE_OVERRIDE.pop()
+        DB_FOR_READ_OVERRIDE.set(self.original_read_db)
+        DB_FOR_WRITE_OVERRIDE.set(self.original_write_db)
         if self.created_db_config:
             connections[self.unique_db_id].close()
             del connections.databases[self.unique_db_id]
-
+ 
     def __call__(self, querying_func):
         @wraps(querying_func)
         def inner(*args, **kwargs):
-            # Call the function in our context manager
             with self:
                 return querying_func(*args, **kwargs)
         return inner
