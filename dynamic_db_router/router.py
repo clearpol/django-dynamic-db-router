@@ -2,6 +2,7 @@ from contextvars import ContextVar
 from functools import wraps
 from uuid import uuid4
 from django.db import connections
+import asyncio
 
 # Define context variables for read and write database settings
 # These variables will maintain database preferences per context
@@ -86,6 +87,28 @@ class in_database:
         else:
             raise ValueError("database must be an identifier (str) for an existing db, "
                              "or a complete configuration (dict).")
+    
+    def _close_connection(self):
+        connections[self.unique_db_id].close()
+        del connections.databases[self.unique_db_id]
+    
+    async def __aenter__(self):
+        self.original_read_db = DB_FOR_READ_OVERRIDE.get()
+        self.original_write_db = DB_FOR_WRITE_OVERRIDE.get()
+
+        if self.read:
+            DB_FOR_READ_OVERRIDE.set(self.database)
+        if self.write:
+            DB_FOR_WRITE_OVERRIDE.set(self.database)
+        return self
+            
+    async def __aexit__(self, exc_type, exc, tb):
+        DB_FOR_READ_OVERRIDE.set(self.original_read_db)
+        DB_FOR_WRITE_OVERRIDE.set(self.original_write_db)
+
+        if self.created_db_config:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._close_connection)
 
     def __enter__(self):
         # Capture the current database settings
